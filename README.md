@@ -20,7 +20,7 @@ It supports Pi and tmux only. There are no runtime npm dependencies, background 
 ## Install
 
 ```sh
-pi install npm:@qianweiyang/pi-tmux@0.1.1
+pi install npm:@qianweiyang/pi-tmux
 ```
 
 The extension adds the package's `bin/` directory to commands started by Pi and gives the parent Agent a hidden discovery hint. No separate skill installation is needed.
@@ -28,7 +28,7 @@ The extension adds the package's `bin/` directory to commands started by Pi and 
 `pi install` does not add the CLI to your login shell. The parent Agent invokes it through Pi's `bash` tool. To use `pi-tmux` directly from an ordinary shell, also install the same package globally:
 
 ```sh
-npm install -g @qianweiyang/pi-tmux@0.1.1
+npm install -g @qianweiyang/pi-tmux
 ```
 
 ## Built-in Agent guide
