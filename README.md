@@ -31,11 +31,28 @@ The extension adds the package's `bin/` directory to commands started by Pi and 
 npm install -g @jokerqianwei/pi-tmux@0.1.0
 ```
 
-To inspect the complete Agent workflow:
+## Built-in Agent guide
+
+The CLI embeds its Agent operating guide. The option is singular:
 
 ```sh
 pi-tmux --skill
 ```
+
+This prints a Markdown guide that explains when to delegate, how to start and
+wait for parallel children, when to inspect a pane, and how to handle blocked
+agents safely.
+
+The guide is self-describing, following the same pattern as `herdr --skill`:
+
+1. Before the first parent model call, the extension adds a hidden discovery
+   hint telling the Agent when to run `pi-tmux --skill`.
+2. The Agent invokes the command through Pi's existing `bash` tool.
+3. The command output guides subsequent `start`, `prompt`, `get`, `read`,
+   `wait`, `resume`, `send-keys`, and `stop` calls.
+
+It is not installed into `~/.agents/skills` or `~/.pi/agent/skills`, and it
+does not add a permanent skill entry to Pi's system prompt.
 
 ## Usage
 
