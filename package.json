@@ -1,6 +1,6 @@
 {
-  "name": "@jokerqianwei/pi-tmux",
-  "version": "0.1.0",
+  "name": "@qianweiyang/pi-tmux",
+  "version": "0.1.1",
   "description": "Control visible Pi subagents in tmux",
   "license": "MIT",
   "author": "JokerQianwei",
