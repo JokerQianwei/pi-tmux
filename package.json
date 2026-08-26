@@ -1,0 +1,58 @@
+{
+  "name": "@jokerqianwei/pi-tmux",
+  "version": "0.1.0",
+  "description": "Control visible Pi subagents in tmux",
+  "license": "MIT",
+  "author": "JokerQianwei",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JokerQianwei/pi-tmux.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JokerQianwei/pi-tmux/issues"
+  },
+  "homepage": "https://github.com/JokerQianwei/pi-tmux#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "tmux",
+    "subagent"
+  ],
+  "files": [
+    "bin",
+    "extensions",
+    "docs/design.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "pi-tmux": "bin/pi-tmux"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/pi-tmux/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test tests/pi-tmux.test.mjs"
+  }
+}

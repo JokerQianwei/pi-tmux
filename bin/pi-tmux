@@ -1,0 +1,869 @@
+#!/usr/bin/env node
+"use strict";
+
+const { randomUUID } = require("node:crypto");
+const {
+  accessSync,
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  constants,
+} = require("node:fs");
+const { homedir } = require("node:os");
+const { delimiter, join, resolve } = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { version: CLI_VERSION } = require("../package.json");
+
+const PROTOCOL_VERSION = 1;
+const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const BOOLEAN_OPTIONS = new Set(["wait"]);
+const KEY_MAP = new Map([
+  ["esc", "Escape"],
+  ["enter", "Enter"],
+  ["tab", "Tab"],
+  ["space", "Space"],
+  ["up", "Up"],
+  ["down", "Down"],
+  ["left", "Left"],
+  ["right", "Right"],
+  ["home", "Home"],
+  ["end", "End"],
+  ["pageup", "PPage"],
+  ["pagedown", "NPage"],
+]);
+
+const HELP = `pi-tmux — control visible Pi subagents in tmux
+
+Usage:
+  pi-tmux start <name> --title <title> --task <text> [options]
+  pi-tmux prompt <name> <text> [--wait] [--timeout <seconds>]
+  pi-tmux get <name>
+  pi-tmux list
+  pi-tmux read <name> [--lines <count>]
+  pi-tmux wait <name> [--timeout <seconds>]
+  pi-tmux resume <name> [--prompt <text>] [options]
+  pi-tmux send-keys <name> <key...>
+  pi-tmux stop <name>
+  pi-tmux --skill
+
+Start options:
+  --cwd <dir>          Child working directory (default: current directory)
+  --provider <id>      Provider override (default: inherit parent Pi)
+  --model <id>         Model override (default: inherit parent Pi)
+  --thinking <level>   off|minimal|low|medium|high|xhigh|max
+  --wait               Wait for the next settled result
+  --timeout <seconds>  Wait timeout (default: 600)
+
+Resume uses the child session's saved model by default. Provider, model, and
+thinking options explicitly override it.
+
+Are you an AI?
+  To control Pi subagents in tmux, run: pi-tmux --skill
+`;
+
+const SKILL = `---
+name: pi-tmux
+description: Control visible Pi subagents running in tmux.
+---
+
+# Pi tmux subagents
+
+Use pi-tmux only for work that benefits from an independent Pi context.
+
+## Workflow
+
+1. Start a self-contained task in an explicit cwd:
+   pi-tmux start <name> --title "<short title>" --task "<complete task>" --cwd "$PWD"
+2. For a dependency, add --wait. For parallel work, start every child first,
+   then wait for each by name.
+3. Do not repeat work already delegated.
+4. Use pi-tmux get before deciding how to interact.
+5. Use pi-tmux read before sending keys or diagnosing a blocked child.
+6. Use pi-tmux prompt only when the child is idle or done.
+7. If state is blocked, ask the user before answering or confirming anything.
+8. Run concurrent writers only when their file scopes cannot overlap.
+
+## Commands
+
+- start: create a detached tmux window and launch a named Pi session
+- prompt: send text to an idle or done child; --wait returns the next result
+- get/list: inspect structured lifecycle state
+- read: capture recent terminal output without changing focus
+- wait: wait for a settled result; timeout never kills the child
+- resume: reopen the same child Pi session after its pane exits
+- send-keys: send validated logical keys after inspecting the pane
+- stop: close the pane but preserve its Pi session for resume
+
+Never infer completion from pane text. Use get or wait. Never target a pane
+outside the current parent Pi session.
+`;
+
+class CliError extends Error {
+  constructor(message, code = 1) {
+    super(message);
+    this.code = code;
+  }
+}
+
+function parseArgs(args) {
+  const options = {};
+  const positionals = [];
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i];
+    if (!value.startsWith("--")) {
+      positionals.push(value);
+      continue;
+    }
+    const key = value.slice(2);
+    if (BOOLEAN_OPTIONS.has(key)) {
+      options[key] = true;
+      continue;
+    }
+    const next = args[++i];
+    if (next === undefined || next.startsWith("--")) {
+      throw new CliError(`--${key} requires a value`);
+    }
+    options[key] = next;
+  }
+  return { options, positionals };
+}
+
+function rejectUnknownOptions(options, allowed) {
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) throw new CliError(`unknown option: --${key}`);
+  }
+}
+
+function requireName(value) {
+  if (!value || !NAME_RE.test(value)) {
+    throw new CliError("name must match [a-z][a-z0-9_-]{0,31}");
+  }
+  return value;
+}
+
+function requireText(value, label) {
+  if (!value || value.includes("\0")) throw new CliError(`${label} must not be empty`);
+  return value;
+}
+
+function parsePositiveInteger(value, fallback, label) {
+  if (value === undefined) return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) throw new CliError(`${label} must be a positive integer`);
+  return number;
+}
+
+function validateThinking(value) {
+  if (value !== undefined && !THINKING_LEVELS.has(value)) {
+    throw new CliError(`invalid thinking level: ${value}`);
+  }
+}
+
+function agentRoot() {
+  return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+function parentSessionId() {
+  const value = process.env.PI_SESSION_ID;
+  if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new CliError("PI_SESSION_ID is missing; run pi-tmux from a persistent parent Pi bash tool");
+  }
+  return value;
+}
+
+function requireTmuxContext() {
+  if (!process.env.TMUX || !process.env.TMUX_PANE) {
+    throw new CliError("pi-tmux must run from Pi inside tmux");
+  }
+}
+
+function parentRoot() {
+  return join(agentRoot(), "runtime", "pi-tmux", parentSessionId());
+}
+
+function agentDir(name) {
+  return join(parentRoot(), requireName(name));
+}
+
+async function withAgentLock(name, operation) {
+  const root = parentRoot();
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const lock = join(root, `${requireName(name)}.lock`);
+  const token = randomUUID();
+  const ownerPath = join(root, `.${name}.${token}.owner`);
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({ pid: process.pid, token, createdAt: Date.now(), ownerPath })}\n`,
+    { mode: 0o600 },
+  );
+  let acquired = false;
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        linkSync(ownerPath, lock);
+        acquired = true;
+        break;
+      } catch (error) {
+        if (!error || error.code !== "EEXIST") throw error;
+        let observed;
+        try {
+          observed = lstatSync(lock);
+        } catch (statError) {
+          if (statError.code === "ENOENT") continue;
+          throw statError;
+        }
+        let owner;
+        try {
+          owner = readJson(lock);
+        } catch {}
+        const age = Date.now() - observed.mtimeMs;
+        let stale = age >= 5000;
+        if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+          let ownerAlive = true;
+          try {
+            process.kill(owner.pid, 0);
+          } catch (probeError) {
+            ownerAlive = probeError.code !== "ESRCH";
+          }
+          stale = !ownerAlive || age >= 120000;
+        }
+        if (!stale) throw new CliError(`another operation is already controlling child ${name}`);
+
+        let current;
+        try {
+          current = lstatSync(lock);
+        } catch (statError) {
+          if (statError.code === "ENOENT") continue;
+          throw statError;
+        }
+        if (current.dev === observed.dev && current.ino === observed.ino) {
+          unlinkSync(lock);
+          if (typeof owner?.ownerPath === "string" && owner.ownerPath.startsWith(`${root}/.`)) {
+            rmSync(owner.ownerPath, { force: true });
+          }
+        }
+      }
+    }
+    if (!acquired) throw new CliError(`could not acquire control lock for child ${name}`);
+    return await operation();
+  } finally {
+    if (acquired) {
+      try {
+        const current = lstatSync(lock);
+        const ours = lstatSync(ownerPath);
+        if (current.dev === ours.dev && current.ino === ours.ino) unlinkSync(lock);
+      } catch {}
+    }
+    rmSync(ownerPath, { force: true });
+  }
+}
+
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw new CliError(`cannot read ${path}: ${error.message}`);
+  }
+}
+
+function writeJsonAtomic(path, value) {
+  mkdirSync(resolve(path, ".."), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(temporary, 0o600);
+  renameSync(temporary, path);
+}
+
+function runTmux(args, options = {}) {
+  const result = spawnSync("tmux", args, {
+    encoding: "utf8",
+    input: options.input,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (result.error) throw new CliError(`tmux failed to start: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new CliError((result.stderr || result.stdout || `tmux exited ${result.status}`).trim());
+  }
+  return result.stdout;
+}
+
+function findExecutable(name) {
+  for (const directory of (process.env.PATH || "").split(delimiter)) {
+    if (!directory) continue;
+    const candidate = join(directory, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {}
+  }
+  throw new CliError(`${name} is not available in PATH`);
+}
+
+function currentTmuxSession() {
+  return runTmux(["display-message", "-p", "-t", process.env.TMUX_PANE, "#{session_id}"]).trim();
+}
+
+function killSurface(surface) {
+  if (!surface?.paneId) return;
+  const socketArgs = surface.socketPath ? ["-S", surface.socketPath] : [];
+  spawnSync("tmux", [...socketArgs, "kill-pane", "-t", surface.paneId], { encoding: "utf8" });
+}
+
+function readTmuxIdentity(target, socketOverride) {
+  if (!target) return null;
+  const format = "#{socket_path}\t#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}";
+  const socketArgs = socketOverride ? ["-S", socketOverride] : [];
+  const result = spawnSync("tmux", [...socketArgs, "display-message", "-p", "-t", target, format], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) return null;
+  const [socketPath, serverPid, sessionId, windowId, paneId] = result.stdout.trim().split("\t");
+  return { socketPath, serverPid, sessionId, windowId, paneId };
+}
+
+function paneIsAlive(control) {
+  const current = readTmuxIdentity(control.paneId, control.socketPath);
+  return Boolean(
+    current &&
+      current.socketPath === control.socketPath &&
+      current.serverPid === control.serverPid &&
+      current.sessionId === control.tmuxSessionId &&
+      current.windowId === control.windowId &&
+      current.paneId === control.paneId,
+  );
+}
+
+function currentParentIdentity() {
+  return readTmuxIdentity(process.env.TMUX_PANE);
+}
+
+function sameTmuxContext(control) {
+  const parent = currentParentIdentity();
+  return Boolean(
+    parent &&
+      parent.socketPath === control.socketPath &&
+      parent.serverPid === control.serverPid &&
+      parent.sessionId === control.tmuxSessionId,
+  );
+}
+
+function requireControllable(agent) {
+  if (!agent.summary.controllable) {
+    throw new CliError(`child ${agent.control.name} belongs to another tmux server or session`);
+  }
+}
+
+function createWindow(name, cwd, piArgs, runDir, incarnation) {
+  const piPath = findExecutable("pi");
+  const tmuxSessionId = currentTmuxSession();
+  const output = runTmux([
+    "new-window",
+    "-d",
+    "-P",
+    "-F",
+    "#{pane_id}\t#{window_id}",
+    "-t",
+    `${tmuxSessionId}:`,
+    "-n",
+    `·${name}`,
+    "-c",
+    cwd,
+    "-e",
+    `PI_TMUX_RUN_DIR=${runDir}`,
+    "-e",
+    `PI_TMUX_NAME=${name}`,
+    "-e",
+    `PI_TMUX_PARENT_SESSION_ID=${parentSessionId()}`,
+    "-e",
+    `PI_TMUX_INCARNATION=${incarnation}`,
+    "--",
+    piPath,
+    ...piArgs,
+  ]).trim();
+  const [paneId, windowId] = output.split("\t");
+  if (!paneId?.startsWith("%") || !windowId?.startsWith("@")) {
+    throw new CliError(`unexpected tmux window output: ${output || "(empty)"}`);
+  }
+  try {
+    runTmux(["set-window-option", "-t", paneId, "automatic-rename", "off"]);
+    runTmux(["rename-window", "-t", paneId, `·${name}`]);
+    const identity = readTmuxIdentity(paneId);
+    if (!identity) throw new CliError(`cannot inspect new tmux pane ${paneId}`);
+    return {
+      paneId,
+      windowId,
+      tmuxSessionId,
+      socketPath: identity.socketPath,
+      serverPid: identity.serverPid,
+    };
+  } catch (error) {
+    killSurface({ paneId });
+    throw error;
+  }
+}
+
+function findSessionFile(dir, state, control) {
+  if (state?.sessionFile) return state.sessionFile;
+  if (control.sessionFile) return control.sessionFile;
+  const candidates = readdirSync(dir)
+    .map((file) => /^state-(\d+)\.json$/.exec(file))
+    .filter(Boolean)
+    .sort((left, right) => Number(right[1]) - Number(left[1]));
+  for (const match of candidates) {
+    const previous = readJson(join(dir, `state-${match[1]}.json`));
+    if (previous?.sessionFile) return previous.sessionFile;
+  }
+  return undefined;
+}
+
+function loadAgent(name) {
+  const dir = agentDir(name);
+  const control = readJson(join(dir, "control.json"));
+  if (!control) throw new CliError(`unknown child: ${name}`);
+  const incarnation = control.incarnation || 1;
+  const state = readJson(join(dir, `state-${incarnation}.json`));
+  const result = readJson(join(dir, `result-${incarnation}.json`));
+  const paneAlive = paneIsAlive(control);
+  const controllable = sameTmuxContext(control);
+  const sessionFile = findSessionFile(dir, state, control);
+  const currentIncarnation = state?.incarnation === control.incarnation;
+  const resultGeneration = result?.generation || 0;
+  let effectiveState = paneAlive && currentIncarnation ? state?.state || "starting" : paneAlive ? "starting" : "dead";
+  if (
+    paneAlive &&
+    control.pendingGeneration > resultGeneration &&
+    ["idle", "done"].includes(effectiveState)
+  ) {
+    effectiveState = "submitting";
+  }
+  return {
+    dir,
+    control,
+    state,
+    result,
+    summary: {
+      name,
+      title: control.title,
+      state: effectiveState,
+      activity: state?.activity,
+      paneId: control.paneId,
+      windowId: control.windowId,
+      paneAlive,
+      controllable,
+      generation: resultGeneration,
+      cwd: control.cwd,
+      provider: control.provider,
+      model: control.model,
+      thinking: control.thinking,
+      sessionFile,
+      updatedAt: state?.updatedAt || control.updatedAt,
+    },
+    sessionFile,
+  };
+}
+
+function printJson(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+function resultPayload(agent) {
+  return {
+    ...agent.summary,
+    result: agent.result?.text || "",
+    usage: agent.result?.usage,
+    stopReason: agent.result?.stopReason,
+    errorMessage: agent.result?.errorMessage,
+  };
+}
+
+async function waitForResult(name, minimumGeneration, timeoutSeconds) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (true) {
+    const agent = loadAgent(name);
+    if (
+      (agent.result?.generation || 0) >= minimumGeneration &&
+      (agent.state?.generation || 0) >= minimumGeneration &&
+      ["done", "exited"].includes(agent.state?.state)
+    ) {
+      return resultPayload(agent);
+    }
+    if (!agent.summary.paneAlive) {
+      throw new CliError(`child ${name} exited before producing generation ${minimumGeneration}`);
+    }
+    if (Date.now() >= deadline) {
+      printJson({ ...agent.summary, timedOut: true, targetGeneration: minimumGeneration });
+      throw new CliError(`timed out waiting for ${name}`, 124);
+    }
+    await sleep(250);
+  }
+}
+
+async function waitForReady(name, timeoutSeconds = 30) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (true) {
+    const agent = loadAgent(name);
+    if (agent.state?.incarnation === agent.control.incarnation && ["idle", "done"].includes(agent.state.state)) {
+      return agent;
+    }
+    if (!agent.summary.paneAlive) throw new CliError(`child ${name} exited before becoming ready`);
+    if (Date.now() >= deadline) throw new CliError(`timed out waiting for ${name} to become ready`);
+    await sleep(100);
+  }
+}
+
+async function submitPrompt(agent, text) {
+  const baseline = agent.result?.generation || 0;
+  const control = {
+    ...agent.control,
+    pendingGeneration: baseline + 1,
+    updatedAt: new Date().toISOString(),
+  };
+  writeJsonAtomic(join(agent.dir, "control.json"), control);
+  const buffer = `pi-tmux-${randomUUID()}`;
+  try {
+    runTmux(["load-buffer", "-b", buffer, "-"], { input: text });
+    runTmux(["paste-buffer", "-p", "-d", "-b", buffer, "-t", agent.control.paneId]);
+    await sleep(100);
+    runTmux(["send-keys", "-t", agent.control.paneId, "Enter"]);
+  } catch (error) {
+    writeJsonAtomic(join(agent.dir, "control.json"), agent.control);
+    throw error;
+  }
+  return baseline + 1;
+}
+
+function inheritedModelOptions(options) {
+  const provider = options.provider ?? process.env.PI_PROVIDER;
+  const model = options.model ?? process.env.PI_MODEL;
+  const thinking = options.thinking ?? process.env.PI_REASONING_LEVEL;
+  validateThinking(thinking);
+  return { provider, model, thinking };
+}
+
+function appendModelArgs(args, settings) {
+  if (settings.provider) args.push("--provider", settings.provider);
+  if (settings.model) args.push("--model", settings.model);
+  if (settings.thinking) args.push("--thinking", settings.thinking);
+}
+
+async function startCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set(["title", "task", "cwd", "provider", "model", "thinking", "wait", "timeout"]));
+  const name = requireName(positionals[0]);
+  if (positionals.length !== 1) throw new CliError("start accepts exactly one child name");
+  const title = requireText(options.title, "title");
+  const task = requireText(options.task, "task");
+  const cwd = realpathSync(resolve(options.cwd || process.cwd()));
+  if (!statSync(cwd).isDirectory()) throw new CliError(`cwd is not a directory: ${cwd}`);
+  const timeout = parsePositiveInteger(options.timeout, 600, "timeout");
+  const dir = agentDir(name);
+  await withAgentLock(name, async () => {
+    if (existsSync(dir)) throw new CliError(`child ${name} already exists; use prompt or resume`);
+
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+    const taskPath = join(dir, "task.md");
+    writeFileSync(taskPath, `${task}\n`, { mode: 0o600 });
+    chmodSync(taskPath, 0o600);
+
+    const childSessionId = randomUUID();
+    const model = inheritedModelOptions(options);
+    const piArgs = ["--session-id", childSessionId, "--name", title];
+    appendModelArgs(piArgs, model);
+    piArgs.push(`@${taskPath}`);
+
+    const now = new Date().toISOString();
+    const control = {
+      version: PROTOCOL_VERSION,
+      name,
+      title,
+      parentSessionId: parentSessionId(),
+      childSessionId,
+      cwd,
+      provider: model.provider,
+      model: model.model,
+      thinking: model.thinking,
+      paneId: null,
+      windowId: null,
+      incarnation: 1,
+      pendingGeneration: 1,
+      createdAt: now,
+      updatedAt: now,
+      resumeCount: 0,
+    };
+    writeJsonAtomic(join(dir, "control.json"), control);
+
+    let surface;
+    try {
+      surface = createWindow(name, cwd, piArgs, dir, control.incarnation);
+      Object.assign(control, surface, {
+        updatedAt: new Date().toISOString(),
+      });
+      writeJsonAtomic(join(dir, "control.json"), control);
+    } catch (error) {
+      killSurface(surface);
+      rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
+  });
+
+  if (options.wait) {
+    printJson(await waitForResult(name, 1, timeout));
+    return;
+  }
+  printJson(loadAgent(name).summary);
+}
+
+async function promptCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set(["wait", "timeout"]));
+  const name = requireName(positionals.shift());
+  const text = requireText(positionals.join(" "), "prompt");
+  const timeout = parsePositiveInteger(options.timeout, 600, "timeout");
+  const targetGeneration = await withAgentLock(name, async () => {
+    const agent = loadAgent(name);
+    requireControllable(agent);
+    if (!agent.summary.paneAlive) throw new CliError(`child ${name} is dead; use resume`);
+    if (!["idle", "done"].includes(agent.summary.state)) {
+      throw new CliError(`child ${name} is ${agent.summary.state}; prompt requires idle or done`);
+    }
+    return submitPrompt(agent, text);
+  });
+
+  if (options.wait) {
+    printJson(await waitForResult(name, targetGeneration, timeout));
+    return;
+  }
+  printJson({ ...loadAgent(name).summary, submitted: true, targetGeneration });
+}
+
+function getCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set());
+  if (positionals.length !== 1) throw new CliError("get requires one child name");
+  printJson(loadAgent(requireName(positionals[0])).summary);
+}
+
+function listCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set());
+  if (positionals.length !== 0) throw new CliError("list accepts no arguments");
+  const root = parentRoot();
+  const names = existsSync(root)
+    ? readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && NAME_RE.test(entry.name))
+        .map((entry) => entry.name)
+        .sort()
+    : [];
+  printJson({ agents: names.map((name) => loadAgent(name).summary) });
+}
+
+function readCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set(["lines"]));
+  if (positionals.length !== 1) throw new CliError("read requires one child name");
+  const lines = parsePositiveInteger(options.lines, 120, "lines");
+  if (lines > 1000) throw new CliError("lines must not exceed 1000");
+  const agent = loadAgent(requireName(positionals[0]));
+  requireControllable(agent);
+  if (!agent.summary.paneAlive) throw new CliError(`child ${agent.control.name} is dead`);
+  process.stdout.write(
+    runTmux(["capture-pane", "-p", "-J", "-t", agent.control.paneId, "-S", `-${lines}`]),
+  );
+}
+
+async function waitCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set(["timeout"]));
+  if (positionals.length !== 1) throw new CliError("wait requires one child name");
+  const name = requireName(positionals[0]);
+  const timeout = parsePositiveInteger(options.timeout, 600, "timeout");
+  const agent = loadAgent(name);
+  const generation = agent.result?.generation || 0;
+  const settled =
+    generation > 0 &&
+    (agent.control.pendingGeneration || 0) <= generation &&
+    (agent.state?.generation || 0) >= generation &&
+    ["done", "exited"].includes(agent.state?.state);
+  const pending = agent.control.pendingGeneration || generation + 1;
+  const minimum = settled ? generation : Math.max(generation, pending);
+  printJson(await waitForResult(name, minimum, timeout));
+}
+
+async function resumeCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set(["prompt", "provider", "model", "thinking", "wait", "timeout"]));
+  if (positionals.length !== 1) throw new CliError("resume requires one child name");
+  const name = requireName(positionals[0]);
+  const timeout = parsePositiveInteger(options.timeout, 600, "timeout");
+  validateThinking(options.thinking);
+  if (options.wait && options.prompt === undefined) throw new CliError("resume --wait requires --prompt");
+  if (options.prompt !== undefined) requireText(options.prompt, "prompt");
+  const outcome = await withAgentLock(name, async () => {
+    const agent = loadAgent(name);
+    if (agent.summary.paneAlive) {
+      return { alreadyAlive: agent.summary };
+    }
+    const sessionFile = agent.sessionFile;
+    if (!sessionFile || !existsSync(sessionFile)) {
+      throw new CliError(`child ${name} has no resumable Pi session file`);
+    }
+
+    const piArgs = ["--session", sessionFile];
+    appendModelArgs(piArgs, {
+      provider: options.provider,
+      model: options.model,
+      thinking: options.thinking,
+    });
+    const incarnation = (agent.control.incarnation || 1) + 1;
+    const control = {
+      ...agent.control,
+      incarnation,
+      provider: options.provider ?? agent.control.provider,
+      model: options.model ?? agent.control.model,
+      thinking: options.thinking ?? agent.control.thinking,
+      sessionFile,
+      pendingGeneration: agent.result?.generation || 0,
+      paneId: null,
+      windowId: null,
+      resumeCount: (agent.control.resumeCount || 0) + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    writeJsonAtomic(join(agent.dir, "control.json"), control);
+    if (agent.result) {
+      writeJsonAtomic(join(agent.dir, `result-${incarnation}.json`), agent.result);
+    }
+    let surface;
+    try {
+      surface = createWindow(name, agent.control.cwd, piArgs, agent.dir, incarnation);
+      Object.assign(control, surface, {
+        updatedAt: new Date().toISOString(),
+      });
+      writeJsonAtomic(join(agent.dir, "control.json"), control);
+    } catch (error) {
+      killSurface(surface);
+      writeJsonAtomic(join(agent.dir, "control.json"), agent.control);
+      throw error;
+    }
+
+    let targetGeneration;
+    if (options.prompt !== undefined) {
+      const ready = await waitForReady(name);
+      targetGeneration = await submitPrompt(ready, options.prompt);
+    }
+    return { targetGeneration };
+  });
+
+  if (outcome.alreadyAlive) {
+    printJson({ ...outcome.alreadyAlive, resumed: false, reason: "pane-already-alive" });
+    return;
+  }
+  if (options.wait) {
+    printJson(await waitForResult(name, outcome.targetGeneration, timeout));
+    return;
+  }
+  printJson({ ...loadAgent(name).summary, resumed: true });
+}
+
+function mapKey(key) {
+  const normalized = key.toLowerCase();
+  const mapped = KEY_MAP.get(normalized);
+  if (mapped) return mapped;
+  const control = /^ctrl\+([a-z])$/.exec(normalized);
+  if (control) return `C-${control[1]}`;
+  throw new CliError(`unsupported key: ${key}`);
+}
+
+async function sendKeysCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set());
+  const name = requireName(positionals.shift());
+  if (positionals.length === 0) throw new CliError("send-keys requires at least one logical key");
+  const keys = positionals.map(mapKey);
+  const summary = await withAgentLock(name, async () => {
+    const agent = loadAgent(name);
+    requireControllable(agent);
+    if (!agent.summary.paneAlive) throw new CliError(`child ${name} is dead`);
+    runTmux(["send-keys", "-t", agent.control.paneId, "--", ...keys]);
+    return agent.summary;
+  });
+  printJson({ ...summary, keysSent: keys });
+}
+
+async function stopCommand(args) {
+  const { options, positionals } = parseArgs(args);
+  rejectUnknownOptions(options, new Set());
+  if (positionals.length !== 1) throw new CliError("stop requires one child name");
+  const name = requireName(positionals[0]);
+  const result = await withAgentLock(name, async () => {
+    const agent = loadAgent(name);
+    requireControllable(agent);
+    let paneClosed = false;
+    if (agent.summary.paneAlive) {
+      runTmux(["kill-pane", "-t", agent.control.paneId]);
+      paneClosed = true;
+    }
+    const control = {
+      ...agent.control,
+      stoppedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeJsonAtomic(join(agent.dir, "control.json"), control);
+    return { name, state: "stopped", paneClosed, resumable: Boolean(agent.sessionFile) };
+  });
+  printJson(result);
+}
+
+async function main(argv) {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
+    process.stdout.write(HELP);
+    return;
+  }
+  if (argv[0] === "--version" || argv[0] === "-V") {
+    process.stdout.write(`${CLI_VERSION}\n`);
+    return;
+  }
+  if (argv[0] === "--skill") {
+    process.stdout.write(SKILL);
+    return;
+  }
+
+  requireTmuxContext();
+  const [command, ...args] = argv;
+  if (command === "start") return startCommand(args);
+  if (command === "prompt") return promptCommand(args);
+  if (command === "get") return getCommand(args);
+  if (command === "list") return listCommand(args);
+  if (command === "read") return readCommand(args);
+  if (command === "wait") return waitCommand(args);
+  if (command === "resume") return resumeCommand(args);
+  if (command === "send-keys") return sendKeysCommand(args);
+  if (command === "stop") return stopCommand(args);
+  throw new CliError(`unknown command: ${command}`);
+}
+
+main(process.argv.slice(2)).catch((error) => {
+  if (error instanceof CliError && error.code === 124) {
+    process.stderr.write(`pi-tmux: ${error.message}\n`);
+    process.exitCode = 124;
+    return;
+  }
+  process.stderr.write(`pi-tmux: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = error instanceof CliError ? error.code : 1;
+});
