@@ -13,6 +13,13 @@ function run(command, args, env, expectedStatus = 0) {
   return result;
 }
 
+test("every subcommand accepts --help without a tmux context", () => {
+  for (const command of ["start", "prompt", "get", "list", "read", "wait", "resume", "send-keys", "stop"]) {
+    const result = run(cli, [command, "--help"], process.env);
+    assert.match(result.stdout, new RegExp(`pi-tmux ${command.replace("-", "\\-")}`));
+  }
+});
+
 test("pi-tmux controls a named child without changing focus", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "pi-tmux-test-"));
   const socket = `pi-tmux-test-${process.pid}`;
@@ -55,6 +62,17 @@ test("pi-tmux controls a named child without changing focus", async (t) => {
     TMUX: tmuxEnv,
     TMUX_PANE: parentPane,
   };
+
+  assert.match(
+    run(
+      cli,
+      ["start", "invalid", "--title", "Invalid", "--task", "test", "--thinking", "invalid"],
+      env,
+      1,
+    ).stderr,
+    /invalid thinking level/,
+  );
+  assert.deepEqual(JSON.parse(run(cli, ["list"], env).stdout).agents, []);
 
   const started = JSON.parse(
     run(cli, ["start", "worker", "--title", "Worker", "--task", "test", "--cwd", process.cwd()], env).stdout,
@@ -198,6 +216,7 @@ test("pi-tmux controls a named child without changing focus", async (t) => {
   const stopped = JSON.parse(run(cli, ["stop", "worker"], env).stdout);
   assert.equal(stopped.paneClosed, true);
   assert.equal(stopped.resumable, true);
+  assert.equal(stopped.state, JSON.parse(run(cli, ["get", "worker"], env).stdout).state);
   const persisted = JSON.parse(run(cli, ["wait", "worker", "--timeout", "1"], env).stdout);
   assert.equal(persisted.result, "not-settled-yet");
 

@@ -28,6 +28,7 @@ const PROTOCOL_VERSION = 1;
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const BOOLEAN_OPTIONS = new Set(["wait"]);
+const COMMANDS = new Set(["start", "prompt", "get", "list", "read", "wait", "resume", "send-keys", "stop"]);
 const KEY_MAP = new Map([
   ["esc", "Escape"],
   ["enter", "Enter"],
@@ -572,6 +573,7 @@ async function startCommand(args) {
   const cwd = realpathSync(resolve(options.cwd || process.cwd()));
   if (!statSync(cwd).isDirectory()) throw new CliError(`cwd is not a directory: ${cwd}`);
   const timeout = parsePositiveInteger(options.timeout, 600, "timeout");
+  const model = inheritedModelOptions(options);
   const dir = agentDir(name);
   await withAgentLock(name, async () => {
     if (existsSync(dir)) throw new CliError(`child ${name} already exists; use prompt or resume`);
@@ -583,7 +585,6 @@ async function startCommand(args) {
     chmodSync(taskPath, 0o600);
 
     const childSessionId = randomUUID();
-    const model = inheritedModelOptions(options);
     const piArgs = ["--session-id", childSessionId, "--name", title];
     appendModelArgs(piArgs, model);
     piArgs.push(`@${taskPath}`);
@@ -825,7 +826,12 @@ async function stopCommand(args) {
       updatedAt: new Date().toISOString(),
     };
     writeJsonAtomic(join(agent.dir, "control.json"), control);
-    return { name, state: "stopped", paneClosed, resumable: Boolean(agent.sessionFile) };
+    return {
+      name,
+      state: loadAgent(name).summary.state,
+      paneClosed,
+      resumable: Boolean(agent.sessionFile),
+    };
   });
   printJson(result);
 }
@@ -844,8 +850,13 @@ async function main(argv) {
     return;
   }
 
-  requireTmuxContext();
   const [command, ...args] = argv;
+  if (COMMANDS.has(command) && args.some((argument) => argument === "--help" || argument === "-h")) {
+    process.stdout.write(HELP);
+    return;
+  }
+
+  requireTmuxContext();
   if (command === "start") return startCommand(args);
   if (command === "prompt") return promptCommand(args);
   if (command === "get") return getCommand(args);

@@ -117,7 +117,11 @@ pi-tmux resume reviewer --prompt "Continue the review." --wait
 | `send-keys` | Send validated logical keys such as `esc` or `ctrl+c` |
 | `stop` | Close the pane while preserving the Pi session |
 
-Run `pi-tmux --help` for arguments and model overrides.
+Run `pi-tmux --help` or `pi-tmux <command> --help` for arguments and model
+overrides.
+
+Pi binds `esc` to interrupt the active agent. `ctrl+c` keeps Pi's normal
+clear-editor/exit behavior and does not interrupt an active tool.
 
 ## Model selection
 
