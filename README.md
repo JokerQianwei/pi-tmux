@@ -104,6 +104,11 @@ pi-tmux stop reviewer
 pi-tmux resume reviewer --prompt "Continue the review." --wait
 ```
 
+After consuming a result, stop the child when no further prompts or inspection
+are expected. `stop` closes its tmux pane while preserving the Pi session for
+`resume`. Before finishing, list and stop children you started that are no
+longer needed.
+
 ## Commands
 
 | Command | Purpose |

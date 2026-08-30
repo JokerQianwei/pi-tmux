@@ -94,6 +94,10 @@ Use pi-tmux only for work that benefits from an independent Pi context.
 6. Use pi-tmux prompt only when the child is idle or done.
 7. If state is blocked, ask the user before answering or confirming anything.
 8. Run concurrent writers only when their file scopes cannot overlap.
+9. After consuming a child's result, stop it when no further prompts or
+   inspection are expected. stop preserves the Pi session for resume.
+10. Before finishing, list and stop children you started that are no longer
+    needed.
 
 ## Commands
 
