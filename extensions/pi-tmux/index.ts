@@ -46,7 +46,7 @@ const incarnation = Number(process.env.PI_TMUX_INCARNATION ?? "0");
 const BLOCKING_TOOLS = new Set(["ask_question", "ask_user", "question"]);
 const GUIDE_TYPE = "pi-tmux-guide";
 const GUIDE =
-  "When work should be delegated to a visible Pi subagent in tmux, run `pi-tmux --skill` first and follow its output.";
+  "Do tasks yourself by default. Use a visible Pi subagent in tmux only when the user asks for one, or when a substantial, self-contained task can run in parallel while you continue other work. Before using one, run `pi-tmux --skill` and follow its output.";
 
 function exposeCli(): void {
   const binDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../bin");

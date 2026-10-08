@@ -80,7 +80,9 @@ description: Control visible Pi subagents running in tmux.
 
 # Pi tmux subagents
 
-Use pi-tmux only for work that benefits from an independent Pi context.
+Use pi-tmux only when the user asks for subagents, or when a substantial,
+self-contained task can run in parallel with your own work. Do small,
+sequential, or immediately needed work yourself.
 
 ## Workflow
 
