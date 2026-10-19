@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -85,6 +85,10 @@ test("pi-tmux controls a named child without changing focus", async (t) => {
   assert.match(run(cli, ["read", "worker"], env).stdout, /ready/);
 
   const runDir = join(agentDir, "runtime", "pi-tmux", "parent-test", "worker");
+  assert.equal(
+    await readFile(join(runDir, "task.md"), "utf8"),
+    "你是 pi-tmux 子 Agent：直接完成下面的任务，不要再创建 subagent。\n\ntest\n",
+  );
   const secondSocket = `${socket}-second`;
   run("tmux", ["-L", secondSocket, "-f", "/dev/null", "new-session", "-d", "-s", "other"], process.env);
   run("tmux", ["-L", secondSocket, "new-window", "-d"], process.env);

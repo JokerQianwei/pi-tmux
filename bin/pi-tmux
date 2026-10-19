@@ -585,7 +585,10 @@ async function startCommand(args) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
     const taskPath = join(dir, "task.md");
-    writeFileSync(taskPath, `${task}\n`, { mode: 0o600 });
+    // 用户级 AGENTS.md 也会加载到子 Pi；首条消息声明身份，防止它继续委派。
+    writeFileSync(taskPath, `你是 pi-tmux 子 Agent：直接完成下面的任务，不要再创建 subagent。\n\n${task}\n`, {
+      mode: 0o600,
+    });
     chmodSync(taskPath, 0o600);
 
     const childSessionId = randomUUID();

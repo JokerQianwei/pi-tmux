@@ -169,7 +169,7 @@ tmux 3.6 支持 `new-window [shell-command [argument ...]]` 和 `-e KEY=value`�
 - `--session-id <uuid>` 创建稳定、可恢复的 session；
 - `--name <title>` 设置 Pi session 名称；
 - `--provider`、`--model` 与 `--thinking` 默认取父 Pi 的 `PI_PROVIDER`、`PI_MODEL` 和 `PI_REASONING_LEVEL`，也可由 `start` 参数覆盖；
-- `@task.md` 避免把长任务拼进 shell 命令；
+- `@task.md` 避免把长任务拼进 shell 命令；文件开头固定一行“你是 pi-tmux 子 Agent：直接完成下面的任务，不要再创建 subagent。”，再接 `--task` 原文；
 - `-e pi-tmux/index.ts` 不需要，因为该 extension 已在全局目录，环境变量决定它是否启用。
 
 ## 提示和按键
