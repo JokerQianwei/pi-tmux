@@ -110,8 +110,8 @@ description: Control visible Pi subagents running in tmux.
 - send-keys: send validated logical keys after inspecting the pane
 - stop: close the pane but preserve its Pi session for resume
 
-Never infer completion from pane text. Use get or wait. Never target a pane
-outside the current parent Pi session.
+Never infer completion from pane text. Rely on the automatic result message,
+get, or wait. Never target a pane outside the current parent Pi session.
 `;
 
 class CliError extends Error {
