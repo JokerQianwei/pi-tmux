@@ -80,16 +80,14 @@ description: Control visible Pi subagents running in tmux.
 
 # Pi tmux subagents
 
-Use pi-tmux only when the user asks for subagents, or when a substantial,
-self-contained task can run in parallel with your own work. Do small,
-sequential, or immediately needed work yourself.
-
 ## Workflow
 
 1. Start a self-contained task in an explicit cwd:
    pi-tmux start <name> --title "<short title>" --task "<complete task>" --cwd "$PWD"
-2. For a dependency, add --wait. For parallel work, start every child first,
-   then wait for each by name.
+2. Without --wait, the child's final reply is sent to this session
+   automatically as a "[pi-tmux 子任务结果]" message with its name and round.
+   Do not poll get or call wait for it; continue other work or end your turn.
+   Add --wait only when your next step needs the result immediately.
 3. Do not repeat work already delegated.
 4. Use pi-tmux get before deciding how to interact.
 5. Use pi-tmux read before sending keys or diagnosing a blocked child.

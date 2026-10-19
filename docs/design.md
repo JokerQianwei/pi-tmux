@@ -62,7 +62,7 @@ $ pi-tmux --skill
 使用自描述 CLI 而不是常驻父 extension 还有三个直接收益：
 
 - 不向每次模型请求增加七八个控制工具的 schema；
-- 没有父进程 watcher、定时器和结果投递竞态；
+- 没有定时器和轮询；结果由子进程在完成时推送；
 - Agent 的执行路径保持可见：隐藏发现提示 → `pi-tmux --skill` → 后续 CLI 命令 → tmux。
 
 ## 命令体验
@@ -182,6 +182,15 @@ tmux 3.6 支持 `new-window [shell-command [argument ...]]` 和 `-e KEY=value`�
 
 这一点沿用 Herdr 的安全边界：普通工作走 prompt，交互式控制走受验证的逻辑键；不能把任意字符串解释为 tmux key token。
 
+## 结果回传
+
+父 Pi 在 tmux 中运行时，于 `<parent-session-id>/parent.sock` 监听 Unix socket。子 extension 在 `agent_settled` 写入新结果并发布 `done` 后，连接该 socket 发送结果 JSON；父 extension 以 `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })` 交给主 Agent。
+
+- 先发布 `done` 再推送，主 Agent 收到后可立即 `prompt` 同一子代理；
+- 每个新 generation 只推送一次，`resume` 复制旧结果不会重复推送；
+- 父 Pi 不在线时推送失败并丢弃，结果仍可用 `wait` 读取；
+- 不做补发、确认和重试；显式 `wait` 与自动推送可能看到同一结果。
+
 ## 等待与恢复
 
 `wait` 每 250 ms 读取当前 incarnation 的状态文件，等待 `done` 且 generation 达到目标值：
@@ -227,7 +236,7 @@ tmux 3.6 支持 `new-window [shell-command [argument ...]]` 和 `-e KEY=value`�
 - worktree、自动合并和 verifier；
 - 子代理嵌套；
 - token/time budget 与自动 wrap-up；
-- child-to-parent steer、exactly-once delivery lease；
+- 结果离线补发、exactly-once delivery lease；
 - 父 Pi overlay 和复杂 widget。
 
 ## 内置 Agent 指南的关键规则

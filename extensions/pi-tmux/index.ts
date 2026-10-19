@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { chmod, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createConnection, createServer, type Server } from "node:net";
+import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -44,9 +46,7 @@ const name = process.env.PI_TMUX_NAME;
 const paneId = process.env.TMUX_PANE;
 const incarnation = Number(process.env.PI_TMUX_INCARNATION ?? "0");
 const BLOCKING_TOOLS = new Set(["ask_question", "ask_user", "question"]);
-const GUIDE_TYPE = "pi-tmux-guide";
-const GUIDE =
-  "Do tasks yourself by default. Use a visible Pi subagent in tmux only when the user asks for one, or when a substantial, self-contained task can run in parallel while you continue other work. Before using one, run `pi-tmux --skill` and follow its output.";
+const PARENT_SOCKET = "parent.sock";
 
 function exposeCli(): void {
   const binDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../bin");
@@ -89,23 +89,68 @@ function assistantText(message?: AssistantMessage): string {
     .join("\n");
 }
 
+function resultMessage(result: ResultRecord): string {
+  const lines = ["[pi-tmux 子任务结果]", `子 Agent：${result.name}`, `轮次：${result.generation}`];
+  if (result.errorMessage) lines.push(`错误：${result.errorMessage}`);
+  lines.push("结果：", result.text);
+  return lines.join("\n");
+}
+
+// 父 Pi 在 tmux 中为当前会话监听 socket，把子 Agent 推送的最终结果交给主 Agent。
+function listenForResults(pi: ExtensionAPI): void {
+  let server: Server | undefined;
+  let socketPath: string | undefined;
+
+  const close = async () => {
+    server?.close();
+    if (socketPath) await rm(socketPath, { force: true });
+    server = undefined;
+    socketPath = undefined;
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (!process.env.TMUX) return;
+    // 与 CLI 的 parentRoot() 保持同一路径，子 Agent 运行目录的上一级就是这里。
+    const root = join(
+      process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"),
+      "runtime",
+      "pi-tmux",
+      ctx.sessionManager.getSessionId(),
+    );
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    socketPath = join(root, PARENT_SOCKET);
+    await rm(socketPath, { force: true });
+    server = createServer((socket) => {
+      let body = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk) => (body += chunk));
+      socket.on("end", () => {
+        const result = JSON.parse(body) as ResultRecord;
+        pi.sendMessage(
+          { customType: "pi-tmux-result", content: resultMessage(result), display: true },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      });
+    });
+    const listening = server;
+    await new Promise<void>((resolveListen, rejectListen) => {
+      listening.once("error", rejectListen);
+      listening.listen(socketPath, resolveListen);
+    });
+    await chmod(socketPath, 0o600);
+  });
+
+  pi.on("session_shutdown", close);
+}
+
 export default function (pi: ExtensionAPI) {
   exposeCli();
 
   if (!runDir || !name) {
-    pi.on("before_agent_start", (_event, ctx) => {
-      const alreadyAdded = ctx.sessionManager
-        .buildContextEntries()
-        .some((entry) => entry.type === "custom_message" && entry.customType === GUIDE_TYPE);
-      if (alreadyAdded) return;
-      return {
-        message: { customType: GUIDE_TYPE, content: GUIDE, display: false },
-      };
-    });
+    listenForResults(pi);
     return;
   }
 
-  // 普通 Pi 不承担父端 watcher；只有 pi-tmux 启动的子进程发布状态。
   const statePath = join(runDir, `state-${incarnation}.json`);
   const resultPath = join(runDir, `result-${incarnation}.json`);
   const controlPath = join(runDir, "control.json");
@@ -185,10 +230,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", async (_event, ctx) => {
     const { entryId, message } = latestAssistant(ctx);
+    let result: ResultRecord | undefined;
     if (entryId && entryId !== lastResultEntryId) {
       generation++;
       lastResultEntryId = entryId;
-      const result: ResultRecord = {
+      const record: ResultRecord = {
         version: 1,
         name,
         generation,
@@ -203,12 +249,20 @@ export default function (pi: ExtensionAPI) {
       };
       writes = writes.then(async () => {
         if (!(await ownsIncarnation())) return;
-        await writeJsonAtomic(resultPath, result);
+        await writeJsonAtomic(resultPath, record);
+        result = record;
       });
       await writes;
     }
     activeTools.clear();
     await publishState("done", ctx);
+    // 先发布 done 再通知，主 Agent 收到结果后可以立即 prompt 同一个子 Agent。
+    // 父 Pi 不在线时连接失败，结果仍可通过 wait 读取。
+    if (result) {
+      createConnection(join(dirname(runDir), PARENT_SOCKET))
+        .on("error", () => undefined)
+        .end(JSON.stringify(result));
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

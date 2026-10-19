@@ -23,7 +23,7 @@ It supports Pi and tmux only. There are no runtime npm dependencies, background 
 pi install npm:@qianweiyang/pi-tmux
 ```
 
-The extension adds the package's `bin/` directory to commands started by Pi and gives the parent Agent a hidden discovery hint. No separate skill installation is needed.
+The extension adds the package's `bin/` directory to commands started by Pi. It does not inject prompts; tell Agents when to use subagents in your user-level `AGENTS.md`. No separate skill installation is needed.
 
 `pi install` does not add the CLI to your login shell. The parent Agent invokes it through Pi's `bash` tool. To use `pi-tmux` directly from an ordinary shell, also install the same package globally:
 
@@ -39,14 +39,14 @@ The CLI embeds its Agent operating guide. The option is singular:
 pi-tmux --skill
 ```
 
-This prints a Markdown guide that explains when to delegate, how to start and
-wait for parallel children, when to inspect a pane, and how to handle blocked
+This prints a Markdown guide that explains how to start and wait for parallel
+children, when to inspect a pane, and how to handle blocked
 agents safely.
 
 The guide is self-describing, following the same pattern as `herdr --skill`:
 
-1. Before the first parent model call, the extension adds a hidden discovery
-   hint telling the Agent when to run `pi-tmux --skill`.
+1. Your `AGENTS.md` tells the Agent when to delegate and to run
+   `pi-tmux --skill` before using a subagent.
 2. The Agent invokes the command through Pi's existing `bash` tool.
 3. The command output guides subsequent `start`, `prompt`, `get`, `read`,
    `wait`, `resume`, `send-keys`, and `stop` calls.
@@ -66,7 +66,10 @@ pi-tmux start reviewer \
   --wait
 ```
 
-Start independent work before waiting:
+Start independent work without waiting. When each child settles, its final
+reply is sent to the parent session as a follow-up message labeled with the
+child name and round. An idle parent Agent starts a new turn to handle it; a
+busy one handles it after the current work:
 
 ```sh
 pi-tmux start implementation-reviewer \
@@ -78,10 +81,11 @@ pi-tmux start test-reviewer \
   --title "Test review" \
   --task "Review test coverage." \
   --cwd "$PWD"
-
-pi-tmux wait implementation-reviewer
-pi-tmux wait test-reviewer
 ```
+
+The parent listens on `parent.sock` in its runtime directory while it runs in
+tmux. If the parent Pi is not running, the notification is dropped; the result
+stays on disk for `wait`.
 
 Continue a settled child:
 
